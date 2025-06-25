@@ -1,0 +1,92 @@
+import teradatasql
+
+def generate_tpt_script(script_path, table_name, config, td_cursor):
+    """
+    Dynamically generates a TPT script with schema for exporting a single table from Teradata.
+    """
+
+    td_config = config['teradata']
+    tpt_config = config['tpt_settings']
+    restart_wait_period = tpt_config.get('tpt_restart_wait_period', '600')
+    database = td_config.get('database')
+
+    # Fetch column metadata
+    td_cursor.execute(f"""
+        SELECT ColumnName, ColumnType, ColumnLength
+        FROM dbc.columns
+        WHERE DatabaseName = '{database}'
+          AND TableName = '{table_name.upper()}'
+        ORDER BY ColumnId;
+    """)
+    columns = td_cursor.fetchall()
+
+    if not columns:
+        raise ValueError(f"No columns found for table {database}.{table_name}")
+
+    # Build DEFINE SCHEMA
+    schema_name = f"{table_name.upper()}_SCHEMA"
+    schema_lines = [f"DEFINE SCHEMA {schema_name}", "("]
+    for colname, coltype, collen in columns:
+        if coltype in ['CV', 'CF']:  # VARCHAR / CHAR
+            schema_lines.append(f"    VARCHAR {colname}({collen}),")
+        elif coltype in ['I1', 'I2', 'I', 'I8']:  # Integers
+            schema_lines.append(f"    INTEGER {colname},")
+        elif coltype in ['D']:  # Decimal
+            schema_lines.append(f"    DECIMAL {colname},")
+        elif coltype in ['F']:  # Float
+            schema_lines.append(f"    FLOAT {colname},")
+        elif coltype in ['DA']:  # Date
+            schema_lines.append(f"    DATE {colname},")
+        elif coltype in ['AT', 'TS']:  # Timestamp
+            schema_lines.append(f"    TIMESTAMP {colname},")
+        else:
+            schema_lines.append(f"    VARCHAR {colname}({collen}), -- default")
+
+    schema_lines[-1] = schema_lines[-1].rstrip(',')  # Remove last comma
+    schema_lines.append(");")
+    schema_block = "\n".join(schema_lines)
+
+    # Compose the TPT script
+    tpt_script_content = f"""
+USING CHARACTER SET UTF8
+DEFINE JOB EXPORT_TABLE_JOB
+DESCRIPTION 'Export a single table from Teradata'
+(
+{schema_block}
+
+DEFINE OPERATOR EXPORT_OPERATOR
+TYPE EXPORT
+SCHEMA {schema_name}
+ATTRIBUTES
+(
+    VARCHAR TdpId = '{td_config.get("host")}',
+    VARCHAR UserName = '{td_config.get("user")}',
+    VARCHAR UserPassword = '{td_config.get("password")}',
+    VARCHAR LogonMech = '{td_config.get("logonmech")}',
+    INTEGER MaxSessions = 8,
+    INTEGER MinSessions = 2,
+    INTEGER Tpt_RestartWaitPeriod = {restart_wait_period},
+    VARCHAR SelectStmt = 'SELECT * FROM {database}.{table_name};'
+);
+
+DEFINE OPERATOR FILE_WRITER
+TYPE DATACONNECTOR CONSUMER
+SCHEMA *
+ATTRIBUTES
+(
+    VARCHAR FileName = '{table_name}.csv',
+    VARCHAR Format = 'DELIMITED',
+    VARCHAR OpenMode = 'Write',
+    VARCHAR TextDelimiter = '{tpt_config.get("tpt_output_delimiter", "|")}'
+);
+
+APPLY TO OPERATOR (FILE_WRITER)
+SELECT * FROM OPERATOR (EXPORT_OPERATOR);
+);
+""".strip()
+
+    # Write the script
+    with open(script_path, 'w') as f:
+        f.write(tpt_script_content)
+
+    print(f"Generated TPT script for table '{table_name}' at: {script_path}")
